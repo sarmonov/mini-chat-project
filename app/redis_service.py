@@ -1,10 +1,10 @@
-"""Redis bilan ishlash — online users, tarix, typing, rate limit, read receipts."""
+"""Redis — presence (online/last seen), typing, pub/sub (realtime fan-out)."""
 import json
-from typing import Optional, Any
+from typing import Any, AsyncIterator, Optional
 
 from redis.asyncio import Redis
 
-from app import config
+from app.config import settings
 
 
 class RedisService:
@@ -12,13 +12,13 @@ class RedisService:
         self._client: Optional[Redis] = None
 
     @property
-    def client(self) -> Any:
+    def client(self) -> Redis:
         if self._client is None:
             raise RuntimeError("Redis ulanmagan. Avval connect() chaqiring.")
         return self._client
 
     async def connect(self) -> None:
-        self._client = Redis.from_url(config.REDIS_URL, decode_responses=True)
+        self._client = Redis.from_url(settings.REDIS_URL, decode_responses=True)
         await self._client.ping()
 
     async def close(self) -> None:
@@ -26,86 +26,59 @@ class RedisService:
             await self._client.aclose()
             self._client = None
 
-    # ---------- Auth / Online users ----------
+    # ---------- Presence (online status) ----------
 
-    async def is_username_taken(self, username: str) -> bool:
-        """Username global online_users Set'da bormi (band emasligini tekshirish)."""
-        return bool(await self.client.sismember("online_users", username))
+    def _presence_key(self, user_id: int) -> str:
+        return f"presence:{user_id}"
 
-    async def add_online_user(self, room: str, username: str) -> None:
-        """Userni global va xona ro'yxatiga qo'shadi."""
-        async with self.client.pipeline(transaction=True) as pipe:
-            pipe.sadd("online_users", username)
-            pipe.sadd(f"online_users:{room}", username)
-            await pipe.execute()
+    async def mark_online(self, user_id: int) -> None:
+        """Online belgisi + TTL (heartbeat). Ulanish sonini oshiradi."""
+        await self.client.incr(f"conn:{user_id}")
+        await self.client.set(self._presence_key(user_id), "1", ex=settings.PRESENCE_TTL)
 
-    async def remove_online_user(self, room: str, username: str) -> None:
-        async with self.client.pipeline(transaction=True) as pipe:
-            pipe.srem("online_users", username)
-            pipe.srem(f"online_users:{room}", username)
-            pipe.delete(f"user:{username}:status")
-            await pipe.execute()
+    async def heartbeat(self, user_id: int) -> None:
+        await self.client.set(self._presence_key(user_id), "1", ex=settings.PRESENCE_TTL)
 
-    async def get_online_users(self, room: str) -> list[str]:
-        users = await self.client.smembers(f"online_users:{room}")
-        return sorted(users)
+    async def mark_offline(self, user_id: int) -> int:
+        """Ulanish sonini kamaytiradi. 0 bo'lsa presence o'chiriladi. Qolgan ulanish sonini qaytaradi."""
+        remaining = await self.client.decr(f"conn:{user_id}")
+        if remaining <= 0:
+            await self.client.delete(f"conn:{user_id}")
+            await self.client.delete(self._presence_key(user_id))
+            return 0
+        return remaining
 
-    # ---------- Heartbeat / Status ----------
-
-    async def heartbeat(self, username: str) -> None:
-        """user:{username}:status = online, 30 sekund TTL bilan."""
-        await self.client.set(
-            f"user:{username}:status", "online", ex=config.STATUS_TTL
-        )
-
-    # ---------- Chat tarixi ----------
-
-    async def save_message(self, room: str, message: dict) -> None:
-        """Xabarni xona tarixiga qo'shadi va oxirgi 50 tagacha kesadi."""
-        key = f"chat_history:{room}"
-        async with self.client.pipeline(transaction=True) as pipe:
-            pipe.lpush(key, json.dumps(message))
-            pipe.ltrim(key, 0, config.HISTORY_LIMIT - 1)
-            await pipe.execute()
-
-    async def get_history(self, room: str) -> list[dict]:
-        """Oxirgi 50 ta xabarni eski->yangi tartibida qaytaradi."""
-        raw = await self.client.lrange(f"chat_history:{room}", 0, config.HISTORY_LIMIT - 1)
-        # LPUSH bilan yangi xabar boshida turadi -> ko'rsatish uchun teskari qilamiz
-        return [json.loads(item) for item in reversed(raw)]
-
-    async def next_message_id(self, room: str) -> int:
-        """Xona ichida ketma-ket xabar ID generatsiya qiladi (read receipt uchun)."""
-        return await self.client.incr(f"msg_id:{room}")
+    async def is_online(self, user_id: int) -> bool:
+        return bool(await self.client.exists(self._presence_key(user_id)))
 
     # ---------- Typing indicator ----------
 
-    async def set_typing(self, room: str, username: str) -> None:
-        """typing:{room}:{username} kaliti 3 sekundga o'rnatiladi."""
-        await self.client.setex(f"typing:{room}:{username}", config.TYPING_TTL, "1")
+    async def set_typing(self, chat_id: int, user_id: int) -> None:
+        await self.client.setex(
+            f"typing:{chat_id}:{user_id}", settings.TYPING_TTL, "1"
+        )
 
-    # ---------- Rate limiting ----------
+    # ---------- Pub/Sub (realtime fan-out) ----------
 
-    async def check_rate_limit(self, username: str) -> bool:
-        """1 sekund oynasida RATE_LIMIT_MAX dan oshmaganini tekshiradi.
+    async def publish_event(self, event: dict[str, Any]) -> None:
+        """Realtime eventni umumiy kanalga chiqaradi (barcha instance eshitadi)."""
+        await self.client.publish(settings.RT_CHANNEL, json.dumps(event))
 
-        True  -> ruxsat berildi
-        False -> limitdan oshdi
-        """
-        key = f"rate:{username}"
-        count = await self.client.incr(key)
-        if count == 1:
-            await self.client.expire(key, config.RATE_LIMIT_WINDOW)
-        return count <= config.RATE_LIMIT_MAX
-
-    # ---------- Read receipts ----------
-
-    async def set_last_read(self, room: str, username: str, message_id: int) -> None:
-        """Har bir userning oxirgi o'qigan xabar ID'sini Hash'da saqlaydi."""
-        await self.client.hset(f"read:{room}", username, message_id)
-
-    async def get_read_state(self, room: str) -> dict[str, str]:
-        return await self.client.hgetall(f"read:{room}")
+    async def subscribe_events(self) -> AsyncIterator[dict[str, Any]]:
+        """RT kanalidagi eventlarni oqim sifatida qaytaradi."""
+        pubsub = self.client.pubsub()
+        await pubsub.subscribe(settings.RT_CHANNEL)
+        try:
+            async for message in pubsub.listen():
+                if message.get("type") != "message":
+                    continue
+                try:
+                    yield json.loads(message["data"])
+                except (json.JSONDecodeError, TypeError):
+                    continue
+        finally:
+            await pubsub.unsubscribe(settings.RT_CHANNEL)
+            await pubsub.aclose()
 
 
 # Global instance

@@ -10,4 +10,7 @@ dist/
 build/
 .idea/
 .vscode/
-!RABBITMQ_BASE!
+
+# Media yuklamalari (lokal fayllar)
+uploads/
+!uploads/.gitkeep

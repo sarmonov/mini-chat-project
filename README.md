@@ -1,180 +1,171 @@
-# Real-time Chat — FastAPI + RabbitMQ + Redis
+# Mini Telegram — FastAPI + PostgreSQL + RabbitMQ + Redis
 
-Sodda, lekin real microservice arxitekturasini simulyatsiya qiluvchi real-time chat ilovasi.
-Barcha I/O **async**. WebSocket orqali xabar → **RabbitMQ** queue → consumer → **Redis** → barcha ulanishlarga broadcast.
+Telegram uslubidagi real-time chat ilovasi. To'liq microservice-uslub arxitektura,
+doimiy ma'lumotlar bazasi va real-time yetkazish. **Hammasi lokal ishlaydi.**
 
-PowerShell da RabbitMQ va Redis run qilish
-Holatni ko'rish:
+## Imkoniyatlar
 
-Get-Service RabbitMQ, Redis
-
-Ishga tushirish (admin kerak):
-Start-Service RabbitMQ
-Start-Service Redis
-
-To'xtatish (admin kerak):
-Stop-Service RabbitMQ
-Stop-Service Redis
-
-Qayta ishga tushirish:
-Restart-Service RabbitMQ
+| Funksiya | Tavsif |
+|----------|--------|
+| 🔐 Auth | Ro'yxatdan o'tish / kirish, parol **bcrypt** hash, **JWT** token |
+| 👤 Profil | Ism, bio, avatar; foydalanuvchi qidirish |
+| 💬 Shaxsiy suhbat (1:1) | Ikki foydalanuvchi o'rtasida DM |
+| 👥 Guruhlar | Ko'p a'zoli suhbat, a'zo qo'shish/chiqarish, rollar (owner/admin/member) |
+| 🖼 Media / fayl | Rasm va fayl yuborish (lokal `uploads/` ga saqlanadi) |
+| ✓✓ Read receipts | Kim qayergacha o'qigani |
+| ✍️ Typing indicator | "... yozmoqda" |
+| 🟢 Presence | Onlayn / oxirgi tashrif (last seen) |
+| 🔔 Realtime | WebSocket + Redis pub/sub orqali barcha qurilmalarga bir zumda |
+| 📜 Tarix | PostgreSQL'da doimiy saqlanadi, sahifalab yuklash |
 
 ## Arxitektura
 
 ```
-                  ┌─────────────────────────────────────────────┐
-   Browser  <──WS──>  FastAPI (main.py)                          │
-   (index.html)      │   • WebSocket endpoint /ws/{room}/{user}  │
-        ▲            │   • ConnectionManager (broadcast)         │
-        │            └───────┬───────────────────────┬──────────┘
-        │                    │ publish               │ save/read
-        │                    ▼                       ▼
-        │            ┌───────────────┐       ┌───────────────┐
-        │            │   RabbitMQ    │       │     Redis     │
-        │            │ chat_messages │       │ online_users  │
-        │            │   :{room}     │       │ chat_history  │
-        │            └───────┬───────┘       │ typing / rate │
-        │                    │ consume       │ read receipts │
-        └────broadcast───────┘               └───────────────┘
-              (consumer)
+                         ┌───────────────────────────────────────┐
+  Browser  ◄──WebSocket──►         FastAPI (app/)                 │
+  (SPA)         REST      │  • REST: auth, users, chats, upload   │
+    ▲                     │  • WS /ws  (JWT auth)                  │
+    │                     └───┬──────────────┬───────────────┬────┘
+    │                         │ publish      │ read/write    │ subscribe
+    │                         ▼              ▼               ▼
+    │                 ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+    │                 │   RabbitMQ   │ │  PostgreSQL  │ │    Redis     │
+    │                 │ chat.persist │ │ users/chats/ │ │ presence/    │
+    │                 │  (durable)   │ │ messages/... │ │ typing/pubsub│
+    │                 └──────┬───────┘ └──────────────┘ └──────┬───────┘
+    │                        │ consume  ► DB'ga saqlaydi        │ fan-out
+    └────────broadcast───────┴─────────────────────────────────┘
 ```
 
-**Xabar oqimi:** user yozadi → FastAPI RabbitMQ'ga publish qiladi → consumer (background task) queue'dan oladi → Redis tarixiga saqlaydi → o'sha xonadagi barcha WebSocket ulanishlarga broadcast qiladi.
+**Xabar oqimi:**
+1. Klient WebSocket orqali xabar yuboradi (`{type:"message", chat_id, content}`).
+2. Server xabarni **RabbitMQ** `chat.persist` queue'siga qo'yadi.
+3. Consumer queue'dan oladi → **PostgreSQL**'ga saqlaydi → **Redis** pub/sub kanaliga chiqaradi.
+4. Har bir server instance Redis kanalini tinglaydi → suhbat a'zolarining WebSocket'lariga yetkazadi.
 
-## Funksiyalar
-
-| # | Funksiya | Texnologiya |
-|---|----------|-------------|
-| 1 | Username asosida sodda auth | Redis Set `online_users` |
-| 2 | Real-time umumiy chat | FastAPI WebSocket + RabbitMQ |
-| 3 | Online userlar + kirdi/chiqdi notification | Redis Set + broadcast |
-| 4 | Oxirgi 50 ta xabar tarixi | Redis List `chat_history:{room}` |
-| 5 | Typing indicator ("... yozmoqda") | Redis `SETEX typing:{room}:{user} 3` |
-| 6 | Read receipts (✓ / ✓✓) | Redis Hash `read:{room}` |
-| 7 | Rate limiting (1 sek / 5 xabar) | Redis `INCR` + `EXPIRE` |
-| 8 | Xonalar: general / random / tech | har xonaga alohida queue + Redis kalitlar |
+RabbitMQ — ishonchli saqlash quvuri (yozish yo'lini ajratadi). Redis — presence, typing va
+instance'lararo real-time tarqatish (fan-out).
 
 ## Loyiha strukturasi
 
 ```
 mini-chat-project/
 ├── app/
-│   ├── main.py               # FastAPI app, WebSocket endpoint, consumer bog'lash
-│   ├── config.py             # Sozlamalar (URL, ROOMS, limitlar)
-│   ├── models.py             # Pydantic modellar
-│   ├── redis_service.py      # Redis bilan ishlash
-│   ├── rabbit_service.py     # RabbitMQ publisher + consumer
-│   └── connection_manager.py # WebSocket ulanishlarni boshqarish
-├── static/
-│   └── index.html            # Frontend (HTML + CSS + vanilla JS)
+│   ├── main.py             # FastAPI app, lifecycle, routerlar
+│   ├── config.py           # Sozlamalar (.env / env)
+│   ├── database.py         # SQLAlchemy async engine + session
+│   ├── models.py           # ORM: User, Chat, ChatMember, Message
+│   ├── schemas.py          # Pydantic sxemalar
+│   ├── security.py         # bcrypt + JWT
+│   ├── deps.py             # DB session, joriy foydalanuvchi
+│   ├── chat_service.py     # Suhbat DB yordamchilari
+│   ├── redis_service.py    # presence / typing / pub-sub
+│   ├── rabbit_service.py   # RabbitMQ publisher + consumer
+│   ├── connection_manager.py # WebSocket ulanishlar (user -> sockets)
+│   ├── realtime.py         # Fan-out yadrosi (persist+broadcast, subscriber)
+│   ├── ws.py               # WebSocket endpoint
+│   └── routers/            # auth, users, chats, messages, upload
+├── static/                 # Frontend SPA (index.html, app.js, style.css)
+├── uploads/                # Yuklangan media (gitignored)
+├── docker-compose.yml      # Postgres + Redis + RabbitMQ
 ├── requirements.txt
-└── README.md
-```
-
-## O'rnatish (Windows 10)
-
-### 1. Erlang (RabbitMQ uchun kerak)
-https://www.erlang.org/downloads — yuklab o'rnating.
-
-### 2. RabbitMQ
-https://www.rabbitmq.com/install-windows.html — o'rnating (Windows service sifatida avtomatik ishlaydi, port `5672`).
-
-Management UI (ixtiyoriy):
-```powershell
-rabbitmq-plugins enable rabbitmq_management
-# http://localhost:15672  (guest / guest)
-```
-
-### 3. Redis
-https://github.com/tporadowski/redis/releases — `.msi` faylni o'rnating (Windows service, port `6379`).
-
-Tekshirish:
-```powershell
-redis-cli ping   # -> PONG
+├── .env.example
+└── run.bat                 # Windows uchun bir tugmali ishga tushirish
 ```
 
 ## Ishga tushirish
 
-```powershell
-# 1. Kutubxonalarni o'rnatish
-pip install -r requirements.txt
+### Talablar
+- Python 3.11+
+- Docker Desktop (Postgres, Redis, RabbitMQ uchun — eng oson yo'l)
 
-# 2. Serverni ishga tushirish
-uvicorn app.main:app --reload
+### 1. Infratuzilmani ko'tarish (Docker)
 
-# 3. Browserda ochish
-# http://localhost:8000
+```bash
+docker compose up -d
 ```
 
-## Ishlash tartibi
+Bu uchta konteynerni ishga tushiradi:
+- PostgreSQL — `localhost:5432` (chat / chat / chat)
+- Redis — `localhost:6379`
+- RabbitMQ — `localhost:5672`, Management UI: http://localhost:15672 (guest / guest)
 
-1. RabbitMQ va Redis service'lari ishlayotganini tekshiring.
-2. Browserda `localhost:8000` ochiladi → username + xona tanlanadi.
-3. WebSocket ulanadi → Redis'ga user qo'shiladi → online ro'yxat yangilanadi → oxirgi 50 ta xabar ko'rsatiladi.
-4. Xabar yoziladi → RabbitMQ'ga publish → consumer oladi → Redis'ga saqlaydi → hammaga broadcast.
-5. User chiqsa → Redis'dan o'chiriladi → hammaga "chiqdi" notification.
+### 2. Sozlamalar (ixtiyoriy)
 
-> Sinash uchun ikki xil browser oynasida turli username bilan kiring.
+```bash
+cp .env.example .env
+```
+Standart qiymatlar Docker Compose bilan mos — o'zgartirmasangiz ham ishlaydi.
+
+### 3. Kutubxonalar va server
+
+```bash
+pip install -r requirements.txt
+uvicorn app.main:app --reload
+```
+
+Jadval sxemasi birinchi ishga tushishda avtomatik yaratiladi.
+
+### 4. Ochish
+
+http://localhost:8000 — ro'yxatdan o'ting. Sinash uchun ikki xil browserda (yoki
+oddiy + inkognito) ikkita hisob yarating va bir-biringizga yozing.
+
+> **Windows:** `run.bat` faylini ikki marta bosing — u Docker'ni ko'taradi,
+> kutubxonalarni o'rnatadi va serverni ishga tushiradi.
+
+## API (qisqacha)
+
+| Metod | Yo'l | Tavsif |
+|-------|------|--------|
+| POST | `/api/auth/register` | Ro'yxatdan o'tish → JWT |
+| POST | `/api/auth/login` | Kirish → JWT |
+| GET | `/api/users/me` | Profil |
+| PUT | `/api/users/me` | Profilni yangilash |
+| GET | `/api/users/search?q=` | Foydalanuvchi qidirish |
+| GET | `/api/chats` | Mening suhbatlarim |
+| POST | `/api/chats/private` | Shaxsiy suhbat ochish/topish |
+| POST | `/api/chats/group` | Guruh yaratish |
+| POST | `/api/chats/{id}/members` | Guruhga a'zo qo'shish |
+| DELETE | `/api/chats/{id}/members/{uid}` | A'zoni chiqarish / chiqish |
+| GET | `/api/chats/{id}/messages?before_id=` | Xabar tarixi (sahifalash) |
+| POST | `/api/upload` | Media / fayl yuklash |
+| WS | `/ws?token=<JWT>` | Real-time kanal |
+
+To'liq interaktiv hujjat: http://localhost:8000/docs
+
+### WebSocket protokoli
+
+Klient → server:
+```json
+{"type": "message", "chat_id": 1, "content": "salom", "client_id": "c123"}
+{"type": "typing",  "chat_id": 1}
+{"type": "read",    "chat_id": 1, "message_id": 42}
+{"type": "heartbeat"}
+```
+
+Server → klient: `message`, `typing`, `read`, `presence`, `chat_update`, `error`.
+
+## Ma'lumotlar bazasi (PostgreSQL)
+
+| Jadval | Maqsad |
+|--------|--------|
+| `users` | Foydalanuvchilar (username, parol hash, profil, last_seen) |
+| `chats` | Suhbatlar (private / group) |
+| `chat_members` | A'zolik (rol, oxirgi o'qilgan xabar) |
+| `messages` | Xabarlar (matn, media, reply, vaqt) |
 
 ## Redis kalitlari
 
-| Kalit | Tur | Maqsad |
-|-------|-----|--------|
-| `online_users` | Set | Global username band/bo'shligini tekshirish |
-| `online_users:{room}` | Set | Xonadagi online userlar |
-| `chat_history:{room}` | List | Oxirgi 50 ta xabar (LPUSH + LTRIM) |
-| `user:{username}:status` | String (TTL 30s) | Heartbeat orqali online status |
-| `typing:{room}:{username}` | String (TTL 3s) | Typing indicator |
-| `rate:{username}` | Int (TTL 1s) | Rate limiting (INCR) |
-| `read:{room}` | Hash | Har user oxirgi o'qigan message_id |
-| `msg_id:{room}` | Int | Ketma-ket xabar ID generatori |
+| Kalit | Maqsad |
+|-------|--------|
+| `presence:{user_id}` | Onlayn belgisi (TTL heartbeat) |
+| `conn:{user_id}` | Ochiq ulanishlar soni |
+| `typing:{chat_id}:{user_id}` | Typing indicator (TTL) |
+| `rt:events` (kanal) | Real-time fan-out pub/sub |
 
-## RabbitMQ queue'lari
+## Ishlab chiqarish uchun eslatma
 
-Har bir xona uchun alohida **durable** queue: `chat_messages:general`, `chat_messages:random`, `chat_messages:tech`.
-Startupda har queue uchun alohida consumer background task ishga tushadi.
-
-## Mock rejim (Redis/RabbitMQ o'rnatilmagan bo'lsa)
-
-Agar Redis yoki RabbitMQ o'rnatilmagan bo'lsa, ilova **in-memory mock** bilan ishlay oladi
-(`app/redis_mock.py`, `app/rabbit_mock.py`). Standart holatda mock yoqilgan.
-
-Flaglar (env variable):
-
-| Flag | Default | Vazifasi |
-|------|---------|----------|
-| `USE_MOCKS` | `true` | Umumiy default (ikkalasi uchun) |
-| `USE_REDIS_MOCK` | `USE_MOCKS` | Faqat Redis mock'ini boshqaradi |
-| `USE_RABBIT_MOCK` | `USE_MOCKS` | Faqat RabbitMQ mock'ini boshqaradi |
-
-**Haqiqiy RabbitMQ + mock Redis bilan ishga tushirish** (PowerShell):
-```powershell
-$env:USE_REDIS_MOCK = "true"
-$env:USE_RABBIT_MOCK = "false"
-uvicorn app.main:app --host 0.0.0.0 --port 8000
-```
-
-**To'liq haqiqiy (Redis ham, RabbitMQ ham):**
-```powershell
-$env:USE_MOCKS = "false"
-uvicorn app.main:app
-```
-
-## RabbitMQ'ni service emas, to'g'ridan-to'g'ri ishga tushirish (Windows)
-
-Agar Windows service'da "0 plugins started" muammosi bo'lsa, serverni to'g'ridan-to'g'ri
-ishga tushiring (`rabbitmq-env.bat` yo'llarni to'g'ri hisoblaydi):
-```powershell
-$env:ERLANG_HOME = "C:\Program Files\Erlang OTP"
-& "C:\Program Files\RabbitMQ Server\rabbitmq_server-4.1.2\sbin\rabbitmq-server.bat"
-```
-Management UI: `http://localhost:15672` (guest / guest).
-
-## Sozlamalar
-
-Environment variable orqali o'zgartirish mumkin (`app/config.py`):
-
-```
-REDIS_URL=redis://localhost:6379/0
-RABBITMQ_URL=amqp://guest:guest@localhost:5672/
-```
+- `JWT_SECRET` ni albatta kuchli qiymatga o'zgartiring (`.env`).
+- Media saqlash: hozir lokal disk (`uploads/`). Prod uchun S3/MinIO tavsiya etiladi.
+- Jadval migratsiyalari: hozir `create_all` (sodda). Prod uchun **Alembic** qo'shish mumkin.

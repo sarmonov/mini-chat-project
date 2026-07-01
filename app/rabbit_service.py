@@ -1,30 +1,25 @@
-"""RabbitMQ bilan ishlash — har bir xona uchun alohida queue (publisher + consumer)."""
-import asyncio
+"""RabbitMQ — xabarni ishonchli saqlash quvuri.
+
+Oqim:  WebSocket -> publish(persist job) -> RabbitMQ queue -> consumer
+       -> PostgreSQL'ga saqlaydi -> Redis pub/sub orqali barcha a'zolarga broadcast.
+"""
 import json
 import logging
-from typing import Awaitable, Callable, Optional
+from typing import Optional
 
 import aio_pika
-from aio_pika.abc import AbstractRobustConnection, AbstractChannel
+from aio_pika.abc import AbstractChannel, AbstractRobustConnection
 
-from app import config
+from app.config import settings
 
 logger = logging.getLogger("rabbit")
-
-# Consumer xabarni qabul qilganda chaqiriladigan callback turi
-MessageHandler = Callable[[str, dict], Awaitable[None]]
-
-
-def queue_name(room: str) -> str:
-    """Har bir xona uchun alohida queue nomi: chat_messages:{room}."""
-    return f"chat_messages:{room}"
 
 
 class RabbitService:
     def __init__(self) -> None:
         self._connection: Optional[AbstractRobustConnection] = None
         self._channel: Optional[AbstractChannel] = None
-        self._consumer_tasks: list[asyncio.Task] = []
+        self._consumer_tag: Optional[str] = None
 
     @property
     def channel(self) -> AbstractChannel:
@@ -33,50 +28,42 @@ class RabbitService:
         return self._channel
 
     async def connect(self) -> None:
-        """Robust (avtomatik qayta ulanadigan) connection ochadi va queue'larni e'lon qiladi."""
-        self._connection = await aio_pika.connect_robust(config.RABBITMQ_URL)
+        self._connection = await aio_pika.connect_robust(settings.RABBITMQ_URL)
         self._channel = await self._connection.channel()
-        await self._channel.set_qos(prefetch_count=10)
+        await self._channel.set_qos(prefetch_count=20)
+        # durable queue — server qayta ishga tushsa ham xabarlar yo'qolmaydi
+        await self._channel.declare_queue(settings.MESSAGE_QUEUE, durable=True)
+        logger.info("RabbitMQ ulandi, queue tayyor: %s", settings.MESSAGE_QUEUE)
 
-        # Har bir xona uchun durable queue e'lon qilamiz
-        for room in config.ROOMS:
-            await self._channel.declare_queue(queue_name(room), durable=True)
-        logger.info("RabbitMQ ulandi, queue'lar tayyor: %s", config.ROOMS)
-
-    async def publish(self, room: str, message: dict) -> None:
-        """Xabarni xona queue'siga publish qiladi."""
-        body = json.dumps(message).encode()
+    async def publish_persist(self, job: dict) -> None:
+        """Xabarni saqlash uchun queue'ga job yuboradi."""
         await self.channel.default_exchange.publish(
             aio_pika.Message(
-                body=body,
+                body=json.dumps(job).encode(),
                 delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
                 content_type="application/json",
             ),
-            routing_key=queue_name(room),
+            routing_key=settings.MESSAGE_QUEUE,
         )
 
-    async def start_consumers(self, handler: MessageHandler) -> None:
-        """Har bir xona uchun consumer background task'ini ishga tushiradi."""
-        for room in config.ROOMS:
-            task = asyncio.create_task(self._consume_room(room, handler))
-            self._consumer_tasks.append(task)
+    async def start_consumer(self) -> None:
+        """Saqlash consumer'ini ishga tushiradi."""
+        queue = await self.channel.declare_queue(settings.MESSAGE_QUEUE, durable=True)
+        self._consumer_tag = await queue.consume(self._on_message)
+        logger.info("Consumer ishga tushdi: %s", settings.MESSAGE_QUEUE)
 
-    async def _consume_room(self, room: str, handler: MessageHandler) -> None:
-        queue = await self.channel.declare_queue(queue_name(room), durable=True)
-        logger.info("Consumer ishga tushdi: %s", queue_name(room))
-        async with queue.iterator() as queue_iter:
-            async for message in queue_iter:
-                async with message.process():
-                    try:
-                        payload = json.loads(message.body.decode())
-                        await handler(room, payload)
-                    except Exception:  # noqa: BLE001
-                        logger.exception("Consumer xabarni qayta ishlashda xato (%s)", room)
+    async def _on_message(self, message: aio_pika.abc.AbstractIncomingMessage) -> None:
+        # kech import — aylanma bog'liqlikni oldini olish uchun
+        from app.realtime import persist_and_broadcast
+
+        async with message.process():
+            try:
+                job = json.loads(message.body.decode())
+                await persist_and_broadcast(job)
+            except Exception:  # noqa: BLE001
+                logger.exception("Xabarni saqlash/yuborishda xato")
 
     async def close(self) -> None:
-        for task in self._consumer_tasks:
-            task.cancel()
-        self._consumer_tasks.clear()
         if self._connection is not None:
             await self._connection.close()
             self._connection = None
